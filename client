@@ -1,0 +1,137 @@
+#!/usr/bin/env perl
+
+use v5.014;
+
+use warnings;
+
+use IO::Socket;
+
+use IO::Select;
+
+use Protocol::WebSocket::Client;
+
+my $host = 'localhost';
+
+my $port = 3330;
+
+my $tcp_socket = IO::Socket::INET->new(
+
+	PeerAddr => $host,
+
+	PeerPort => $port,
+
+	Proto => 'tcp',
+
+	Blocking => 1
+
+) or die "Failed to connect to socket: $@";
+
+my $client = Protocol::WebSocket::Client->new(url => "ws://$host:$port");
+
+$client->on(									# client sends to server
+
+	write => sub {
+
+		my $client = shift;
+
+		my ($buf) = @_;
+
+		syswrite $tcp_socket, $buf;
+	}
+);
+
+$client->on(									# client connected to server
+
+	connect => sub {
+
+		my $client = shift;
+	}
+);
+
+$client->on(									# client connection error
+
+	error => sub {
+
+		my $client = shift;
+
+		my ($buf) = @_;
+
+		say "ERROR ON WEBSOCKET: $buf";
+
+		$tcp_socket->close;
+
+		exit;
+	}
+);
+
+$client->on(									# client received from server
+
+	read => sub {
+
+		my $client = shift;
+
+		my ($buf) = @_;
+
+		say "Received from socket: '$buf'";
+	}
+);
+
+$client->connect;								# websocket setup complete, connect to server
+
+
+while (! $client->{hs}->is_done) {						# read until handshake complete
+
+	my $recv_data;
+
+	my $bytes_read = sysread $tcp_socket, $recv_data, 16384;
+
+	if (!defined $bytes_read) {
+	
+		die "sysread on tcp_socket failed: $!" 
+	}
+
+	elsif ($bytes_read == 0) {
+		
+		die "Connection terminated."
+	}
+
+	$client->read($recv_data);
+}
+
+
+my $socket_select = IO::Select->new($tcp_socket);				# create a socket set for select
+
+
+while (1) {
+
+	my ($ready) = IO::Select->select($socket_select);			# call select to see if there is data *before* we attempt to read it
+
+	foreach my $ready_socket (@$ready) {
+
+		my $recv_data;
+
+		my $bytes_read = sysread $ready_socket, $recv_data, 16384;
+
+		if ($ready_socket) {
+
+			if (!defined $bytes_read) { 				# error reading from websocket
+	      
+				die "Error reading from tcp_socket: $!" 
+   			}
+
+			elsif ($bytes_read == 0) {				# remote socket closed
+
+				say "Connection terminated by remote.";
+
+       				exit;
+			} 
+			
+			else {							# data read from remote socket, triggers hander
+
+				$client->read($recv_data);
+			}
+		}
+	}
+}
+
+

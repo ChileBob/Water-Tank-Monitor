@@ -1,0 +1,265 @@
+#!/usr/bin/perl
+
+# Tank water level monitor, by ChileBob
+#
+# Pi Zero 2 W
+# SR04M-2 Waterproof sonar sensor
+# Murata I50115H DC/DC converters (x2) 
+#
+# Notes:-
+#
+# This uses a serial connection to get data from the sonar sensor, which is far more accurate than timing 'pings' !
+#
+# The Pi provides data via a websocket, so you can fetch/stream it via wifi. 
+#
+# You *MUST* do the following :-
+#
+# - enable the serial port
+# - disable login via the serial port
+# - disable bluetooth
+
+# The Murata DC/DC power supplies are small and the sonar sensor creates too much 'noise' on the supply for the Pi.
+# Use two supplies, one for the sensor and one for the Pi - they're cheap, small & allow 9-36 Volt input - or a better power supply.
+#
+# Disclaimers :-
+#
+# No warranty, no support, no guarantee, if you blow up your Pi its not my fault. Use entirely at your own risk.
+
+use RPi::Serial;										# serial port comms
+
+use Net::WebSocket::Server;									# websocket server
+
+use JSON;											# encode/decode JSON
+
+#########################################################################################################################################################
+#
+# CONFIGURATION
+#
+my $result;											# global result hash, sent to clients
+
+$result->{'geom'}->{'height'} = 81.83;								# tank geometry (cm)
+
+$result->{'geom'}->{'width'} = 101;
+
+$result->{'geom'}->{'length'} = 121;
+
+$result->{'geom'}->{'height_offset'} = 30;							# sensor height above full level (cm)
+
+my $avg_samples = 120;										# samples for average (600 samples per minute)
+
+my $port = 3333;										# websocket network port number
+
+#########################################################################################################################################################
+
+my $running = 1;										# runtime flag
+
+my $byte_count = 0;
+
+my $counted = 0;										# number packets received
+
+my @byte;											# buffer of bytes read from serial
+
+my @distance;											# buffer of distance measurements from sensor
+
+my $tank_volume = -1;
+
+my ($serv, $conn) = @_;										# websocket server & client connections
+
+my $serial_port = RPi::Serial->new('/dev/ttyAMA0', 9600) or die("Cant open serial port");	# open serial port
+
+binmode STDOUT;
+
+$SIG{INT} = \&shutdown;										# sig handler for shutdown
+
+my ($serv, $conn) = @_;										# websocket server & client connections
+
+our $client;											# client connections
+
+Net::WebSocket::Server->new(									# websocket server
+
+	listen => $port,
+
+	tick_period => 1,									# time between ticks (seconds)
+
+	on_tick => sub {									# do this every tick_period
+
+		my ($serv, $conn) = @_;
+
+		$result->{'status'} ='OK';							# server status
+
+		$result->{'time'} = time;							# timestamp the data
+
+		$result->{'capacity'} = int(($result->{'geom'}->{'width'} * $result->{'geom'}->{'length'} * $result->{'geom'}->{'height'}) / 1000);		# capacity (litres)
+
+		$result->{'volume'} = read_sonar();						# update tank_volume
+
+#		$result->{'temp'} = cpu_temp();							# update cpu temperature
+
+		if ($running == 1) {								# running, sent to all clients
+
+			foreach my $dest ($serv->connections) { 		
+
+				$dest->send_utf8( to_json( $result ) );					
+			}
+		}
+
+		else {										# tell all clients we're shutting down
+
+			foreach my $dest ($serv->connections) { 				# loop through all connected clients	
+
+				$dest->send_utf8( to_json( { time => time, status => 'OFFLINE' } ) );		# tell client we shutdown	
+
+				$dest->disconnect();						# disconnect client
+			}
+
+			exit(1);
+		}
+
+	},
+
+	on_connect => sub {									# client connecting
+
+		my ($serv, $conn) = @_;
+
+		my $client_ip = $conn->{'ip'};							# ip address of connecting client
+
+		$conn->on(
+
+			handshake => sub {							# new connetion
+
+				$client->{$conn}->{'ip'} = $client_ip;				# cache connection details
+			},
+
+			disconnect => sub {							# client disconnected
+				
+				delete $client->{$conn};					# remove cached client connection
+			},
+
+			binary => sub {								# client sent binary
+
+				my ($conn, $msg) = @_;
+			},
+
+			utf8 => sub {								# client sent string
+
+				my ($conn, $msg) = @_;
+
+				# TODO: allow client to update tank geometry
+				
+				$conn->send_utf8( to_json( $result ) );				# send result
+			}
+		)
+	},
+
+)->start;											# start websocket server
+
+exit;
+
+#####################################################################################################################################################
+#												get CPU temperature
+
+sub cpu_temp {
+
+	if (open (my $fh, '<', '/sys/class/thermal/thermal_zone0/temp')) {
+
+		my $cpu_temp = <$fh>;
+
+		chomp($cpu_temp);
+
+		close ($fh);
+
+		return ($cpu_temp / 1000);
+	}
+
+	return(-1);
+}
+
+#####################################################################################################################################################
+#												receive/parse data from sonar sensor, update tank level
+
+sub read_sonar {
+
+	my $bytes_available = $serial_port->avail;						# check for data on serial port
+
+	while ($bytes_available) {
+
+		--$bytes_available;
+
+		my $chr = $serial_port->getc;							# read a byte
+
+		if ($chr == 0xff) {								# start of frame
+
+			$byte[0] = $chr;
+
+			$byte_count = 1;
+		}
+	
+		else {										# add byte to frame data
+
+			$byte[$byte_count] = $chr;						# store byte
+
+			++$byte_count;								# increment byte counter
+		}
+
+		if ($byte_count == 4) {								# we have all four bytes for this frame
+
+			my $value = ($byte[1] * 0xff) + $byte[2];	
+
+			if ($value != 5977) {							# filter invalid data
+
+				push @distance, (($byte[1] * 0xff) + $byte[2]);			# add to distance buffer
+			}
+		}
+	}
+	
+
+	while ( (scalar @distance) > $avg_samples) {						# keep samples to limit
+
+		shift(@distance);								# drop oldest sample
+	}
+
+	if ( (scalar @distance) > 1) {								# avoid divide by zero when no samples
+
+		my $total = 0;									# get mean distance from samples
+
+		foreach (@distance) {							
+
+			$total += $_;
+		}
+
+		my $avg = $total / ((scalar @distance) * 10);					# mean distance in centimeters
+
+		$result->{'sonar'} = $avg;
+
+		$tank_volume  = int(( ($result->{'geom'}->{'width'} * $result->{'geom'}->{'length'}) * ($result->{'geom'}->{'height'} - ($avg - $result->{'geom'}->{'height_offset'})) ) / 1000);
+
+		if ($tank_volume < 0) {								# don't allow negative tank volume !!
+
+			$tank_volume = 0;
+		}
+
+		if ($tank_volume > $result->{'capacity'}) {					# don't exceed tank capacity
+
+			$tank_volume = $result->{'capacity'};
+
+			$result->{'status'} = 'OVERFLOW';
+		}
+	}
+
+	else {											# no data, return full tank volume
+
+		$tank_volume  = $result->{'capacity'};
+
+		$result->{'status'} = 'OVERFLOW';
+	}
+
+	return($tank_volume);
+}
+
+sub shutdown {											# shutdown interrupt handler
+
+	$serial_port->close;									# close serial port
+
+	$running = 0;
+};
+
